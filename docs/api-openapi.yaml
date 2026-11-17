@@ -1,0 +1,3576 @@
+openapi: 3.0.3
+
+info:
+  title: Collective Commerce API
+  version: "1.0.0"
+  description: |
+    REST API for the Collective Commerce managed group-purchasing and procurement marketplace.
+
+    **Architecture notes:**
+    - All money values are integers in Indian Paise (1 INR = 100 paise).
+    - All timestamps are ISO 8601 UTC strings.
+    - IDs are ULIDs (26-char uppercase strings) unless otherwise noted.
+    - Write endpoints that mutate shared state accept an `Idempotency-Key` header.
+    - Every authenticated request must carry a Bearer JWT issued by `/v1/auth/otp/verify`.
+    - Role/permission enforcement is performed server-side on every endpoint; a 403 is returned
+      when the caller lacks the required role or ownership.
+    - Sealed bids (seller quotations) are **never** returned to buyers, other sellers, or any
+      staff role without the explicit `bids:read:confidential` permission.
+
+  contact:
+    name: Engineering
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.collectivecommerce.in
+    description: Production
+
+tags:
+  - name: Auth
+    description: OTP-based authentication
+  - name: Catalog
+    description: Product catalog and public deal browsing
+  - name: BuyRequests
+    description: Buyer demand requests
+  - name: Groups
+    description: Demand group management (join, reconfirm)
+  - name: Offers
+    description: Negotiated final offers
+  - name: Orders
+    description: Order lifecycle, checkout, and disputes
+  - name: Shipments
+    description: Delivery acknowledgements
+  - name: Me
+    description: Authenticated buyer self-service
+  - name: Seller
+    description: Seller-facing endpoints (onboarding, RFQs, bids, orders, settlements)
+  - name: Internal
+    description: Internal procurement, inspection, settlement, audit (staff only)
+  - name: Webhooks
+    description: Inbound payment provider webhooks
+
+# ---------------------------------------------------------------------------
+# Security schemes
+# ---------------------------------------------------------------------------
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT issued by POST /v1/auth/otp/verify. Include as `Authorization: Bearer <token>`.
+
+  # -------------------------------------------------------------------------
+  # Reusable parameters
+  # -------------------------------------------------------------------------
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        maxLength: 128
+      description: |
+        Client-generated unique key (UUID v4 recommended). The server returns the cached
+        response for duplicate requests within a 24-hour window.
+
+    PageParam:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+
+    PerPageParam:
+      name: per_page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[0-9A-Z]{26}$'
+      description: ULID of the resource.
+
+  # -------------------------------------------------------------------------
+  # Reusable response bodies
+  # -------------------------------------------------------------------------
+  responses:
+    400BadRequest:
+      description: Validation error — the request body or query parameters are invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: "The qty field must be a positive integer."
+              details:
+                - field: qty
+                  issue: must_be_positive_integer
+
+    401Unauthorized:
+      description: Missing or invalid authentication token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: "Authentication required."
+
+    403Forbidden:
+      description: The authenticated user lacks the required role or ownership.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: FORBIDDEN
+              message: "You do not have permission to access this resource."
+
+    404NotFound:
+      description: The requested resource does not exist or is not visible to the caller.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: NOT_FOUND
+              message: "Resource not found."
+
+    409Conflict:
+      description: State conflict — e.g., duplicate idempotency key with different payload, concurrent edit, or invalid state transition.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: CONFLICT
+              message: "The resource is already in a terminal state."
+
+    422UnprocessableEntity:
+      description: Business logic error — the request is well-formed but violates a business rule.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: UNPROCESSABLE
+              message: "Offer has expired and can no longer be accepted."
+
+    429TooManyRequests:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying.
+        X-RateLimit-Limit:
+          schema:
+            type: integer
+        X-RateLimit-Remaining:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: RATE_LIMITED
+              message: "Too many requests. Please retry after 60 seconds."
+
+  # -------------------------------------------------------------------------
+  # Reusable schemas
+  # -------------------------------------------------------------------------
+  schemas:
+
+    # ---- Utility / envelope ------------------------------------------------
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code (SCREAMING_SNAKE_CASE).
+            message:
+              type: string
+              description: Human-readable description suitable for logging.
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field:
+                    type: string
+                  issue:
+                    type: string
+
+    PaginationMeta:
+      type: object
+      required: [page, per_page, total, total_pages]
+      properties:
+        page:
+          type: integer
+        per_page:
+          type: integer
+        total:
+          type: integer
+        total_pages:
+          type: integer
+
+    # ---- Identity ----------------------------------------------------------
+
+    User:
+      type: object
+      required: [id, mobile_hash, status, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        mobile_hash:
+          type: string
+          description: One-way hash of the mobile number. Full mobile is not returned to callers.
+        email:
+          type: string
+          format: email
+          nullable: true
+        display_name:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [active, suspended, deletion_requested, deleted]
+        verified_at:
+          type: string
+          format: date-time
+          nullable: true
+        locale:
+          type: string
+          example: en-IN
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    Organization:
+      type: object
+      required: [id, type, legal_name, verification_status, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        type:
+          type: string
+          enum: [buyer_org, seller]
+        legal_name:
+          type: string
+        tax_id_ref:
+          type: string
+          description: GST/PAN reference (masked for non-owner callers).
+          nullable: true
+        verification_status:
+          type: string
+          enum: [pending, under_review, verified, rejected, suspended]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SellerProfile:
+      type: object
+      required: [id, organization_id, status]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        organization_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        categories:
+          type: array
+          items:
+            type: string
+        service_regions:
+          type: array
+          items:
+            type: string
+        score:
+          type: number
+          format: float
+          nullable: true
+        status:
+          type: string
+          enum: [pending, active, suspended, rejected]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    # ---- Catalog -----------------------------------------------------------
+
+    ProductVariant:
+      type: object
+      required: [id, product_id, sku, name, status]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        product_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        sku:
+          type: string
+        name:
+          type: string
+        attributes:
+          type: object
+          additionalProperties: true
+          description: Key-value product attributes (e.g., color, storage).
+        status:
+          type: string
+          enum: [active, inactive, discontinued]
+
+    # ---- Demand / Buy Requests ---------------------------------------------
+
+    BuyRequest:
+      type: object
+      required: [id, buyer_id, status, qty, region_id, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        buyer_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        variant_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+          nullable: true
+          description: Linked catalog variant, if matched; null while pending catalog match.
+        spec_summary:
+          type: string
+          description: Human-readable product description provided by the buyer.
+        spec_json:
+          type: object
+          additionalProperties: true
+          nullable: true
+        qty:
+          type: integer
+          minimum: 1
+        region_id:
+          type: string
+        purchase_by:
+          type: string
+          format: date
+          nullable: true
+          description: Buyer's preferred purchase deadline (date only, no time).
+        alternatives_acceptable:
+          type: boolean
+          default: false
+        status:
+          type: string
+          enum: [draft, submitted, grouping, rfq_issued, offer_received, accepted, ordered, closed, cancelled]
+        group_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    # ---- Demand Groups -----------------------------------------------------
+
+    DemandGroup:
+      type: object
+      required: [id, variant_id, region_id, status, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        match_key:
+          type: string
+        variant_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        region_id:
+          type: string
+        status:
+          type: string
+          enum: [open, rfq_issued, offer_published, moq_reached, closed, cancelled]
+        member_count:
+          type: integer
+        total_qty_expressed:
+          type: integer
+        closes_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    GroupMembership:
+      type: object
+      required: [id, group_id, buyer_id, qty, intent_level, joined_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        group_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        buyer_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        qty:
+          type: integer
+          minimum: 1
+        intent_level:
+          type: string
+          enum: [interested, purchase_ready, confirmed]
+          description: |
+            interested — expressed interest, no commitment.
+            purchase_ready — buyer has indicated readiness to buy at the right price.
+            confirmed — buyer has reconfirmed after offer publication.
+        confirmed_at:
+          type: string
+          format: date-time
+          nullable: true
+        joined_at:
+          type: string
+          format: date-time
+
+    # ---- RFQ ---------------------------------------------------------------
+
+    RFQ:
+      type: object
+      required: [id, group_id, bid_deadline, status, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        group_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        spec_snapshot:
+          type: object
+          additionalProperties: true
+          description: Immutable specification snapshot at time of RFQ creation.
+        qty_band:
+          type: object
+          required: [min_qty, max_qty]
+          properties:
+            min_qty:
+              type: integer
+              minimum: 1
+            max_qty:
+              type: integer
+        bid_deadline:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [open, closed, cancelled]
+        invited_seller_count:
+          type: integer
+        bid_count:
+          type: integer
+          description: Visible to internal staff only. Not returned to buyers or sellers.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    # ---- Seller Bids -------------------------------------------------------
+
+    SellerBid:
+      type: object
+      description: |
+        Sealed bid. The `latest_revision` and `revisions` arrays are ONLY returned to
+        the submitting seller for their own bids, and to internal staff with
+        `bids:read:confidential` permission. Buyers and other sellers receive 403 for
+        any endpoint returning bid details.
+      required: [id, rfq_id, seller_id, status, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        rfq_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        seller_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        source:
+          type: string
+          enum: [online, offline_recorded]
+        status:
+          type: string
+          enum: [submitted, under_review, shortlisted, rejected, awarded, withdrawn]
+        latest_revision:
+          $ref: '#/components/schemas/SellerBidRevision'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SellerBidRevision:
+      type: object
+      required: [id, bid_id, revision_no, unit_price_paise, moq, submitted_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        bid_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        revision_no:
+          type: integer
+          minimum: 1
+        unit_price_paise:
+          type: integer
+          minimum: 1
+          description: Per-unit price in paise (integer, no fractions).
+        tax_basis:
+          type: string
+          enum: [inclusive, exclusive]
+          description: Whether unit_price_paise includes GST.
+        gst_rate_percent:
+          type: number
+          nullable: true
+          description: Applicable GST rate. Required when tax_basis is exclusive.
+        freight_paise:
+          type: integer
+          minimum: 0
+          description: Total freight charge in paise for the quoted quantity.
+        moq:
+          type: integer
+          minimum: 1
+          description: Minimum order quantity this revision applies to.
+        max_qty:
+          type: integer
+          nullable: true
+        valid_until:
+          type: string
+          format: date-time
+        lead_time_days:
+          type: integer
+          minimum: 0
+        warranty_months:
+          type: integer
+          minimum: 0
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+        submitted_at:
+          type: string
+          format: date-time
+
+    # ---- Offers ------------------------------------------------------------
+
+    Offer:
+      type: object
+      required: [id, group_id, status, version, expires_at, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        group_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        seller_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+          description: Hidden from buyer-facing responses; visible to internal staff.
+          nullable: true
+        source_bid_revision_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+          nullable: true
+          description: Hidden from buyer-facing responses.
+        status:
+          type: string
+          enum: [draft, pending_approval, approved, published, expired, withdrawn, closed]
+        version:
+          type: integer
+          minimum: 1
+          description: Optimistic concurrency version. Increment on each state change.
+        expires_at:
+          type: string
+          format: date-time
+        price_tiers:
+          type: array
+          description: Visible to buyers only after the offer is published.
+          items:
+            $ref: '#/components/schemas/OfferPriceTier'
+        terms_snapshot:
+          type: object
+          additionalProperties: true
+          description: Immutable commercial terms at time of offer publication.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    OfferPriceTier:
+      type: object
+      required: [id, offer_id, min_paid_qty, unit_price_paise]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        offer_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        min_paid_qty:
+          type: integer
+          minimum: 1
+        max_paid_qty:
+          type: integer
+          nullable: true
+        unit_price_paise:
+          type: integer
+          minimum: 1
+
+    # ---- Orders ------------------------------------------------------------
+
+    Order:
+      type: object
+      required: [id, buyer_id, offer_id, status, total_paise, currency, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        buyer_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        group_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        offer_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        status:
+          type: string
+          enum:
+            - pending_payment
+            - payment_processing
+            - paid
+            - moq_pending
+            - moq_reached
+            - confirmed
+            - dispatched
+            - delivered
+            - acknowledged
+            - completed
+            - dispute_open
+            - cancelled
+            - refunded
+        terms_hash:
+          type: string
+          description: SHA-256 of accepted terms snapshot; ensures immutability.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        total_paise:
+          type: integer
+          minimum: 0
+          description: Total order value in paise including taxes and shipping.
+        subtotal_paise:
+          type: integer
+          minimum: 0
+        tax_paise:
+          type: integer
+          minimum: 0
+        shipping_paise:
+          type: integer
+          minimum: 0
+        currency:
+          type: string
+          enum: [INR]
+          default: INR
+        payment_intent_id:
+          type: string
+          nullable: true
+        shipping_address_id:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    OrderItem:
+      type: object
+      required: [id, order_id, variant_id, qty, unit_price_paise]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        order_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        variant_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        qty:
+          type: integer
+          minimum: 1
+        unit_price_paise:
+          type: integer
+          minimum: 1
+        tax_paise:
+          type: integer
+          minimum: 0
+        shipping_paise:
+          type: integer
+          minimum: 0
+        snapshot_json:
+          type: object
+          additionalProperties: true
+          description: Immutable product and price snapshot at time of order creation.
+
+    # ---- Payments ----------------------------------------------------------
+
+    Payment:
+      type: object
+      required: [id, order_id, provider, amount_paise, status, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        order_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        provider:
+          type: string
+          description: Payment gateway/aggregator identifier (e.g., razorpay, cashfree).
+        provider_ref:
+          type: string
+          nullable: true
+          description: Gateway-assigned payment reference.
+        amount_paise:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [created, pending, authorized, captured, failed, refunded, partially_refunded]
+        idempotency_key:
+          type: string
+          description: Client-provided idempotency key for this payment intent creation.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    # ---- Shipments ---------------------------------------------------------
+
+    Shipment:
+      type: object
+      required: [id, order_id, carrier, status, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        seller_fulfillment_order_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        order_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+          description: Derived via seller_fulfillment_order. Included for convenience.
+        carrier:
+          type: string
+          nullable: true
+        tracking_ref:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [pending, dispatched, in_transit, delivered, failed_delivery, returned]
+        estimated_delivery_date:
+          type: string
+          format: date
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    BuyerAcknowledgement:
+      type: object
+      required: [id, order_id, shipment_id, buyer_id, submitted_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        order_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        shipment_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        buyer_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        accepted_qty:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Map of order_item_id to accepted quantity.
+        disputed_qty:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Map of order_item_id to disputed quantity.
+        notes:
+          type: string
+          nullable: true
+        submitted_at:
+          type: string
+          format: date-time
+
+    # ---- Disputes ----------------------------------------------------------
+
+    Dispute:
+      type: object
+      required: [id, order_id, type, status, opened_by, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        order_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        type:
+          type: string
+          enum: [not_delivered, wrong_item, damaged, quantity_short, quality_issue, other]
+        status:
+          type: string
+          enum: [open, under_investigation, resolved, escalated, closed]
+        opened_by:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        assigned_to:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+          nullable: true
+        resolution:
+          type: string
+          nullable: true
+          description: Human-readable resolution summary.
+        resolution_type:
+          type: string
+          enum: [refund, replacement, partial_refund, no_action, escalated_external]
+          nullable: true
+        closed_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    # ---- Settlements -------------------------------------------------------
+
+    Settlement:
+      type: object
+      required: [id, seller_id, status, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        seller_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        provider_ref:
+          type: string
+          nullable: true
+        eligible_paise:
+          type: integer
+          minimum: 0
+        requested_paise:
+          type: integer
+          minimum: 0
+        confirmed_paise:
+          type: integer
+          minimum: 0
+          nullable: true
+        status:
+          type: string
+          enum: [draft, pending_approval, approved, submitted_to_provider, settled, failed, on_hold]
+        settlement_items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SettlementItem'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SettlementItem:
+      type: object
+      required: [id, settlement_id, order_item_id, eligible_qty, amount_paise]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        settlement_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        order_item_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        eligible_qty:
+          type: integer
+          minimum: 0
+        amount_paise:
+          type: integer
+          minimum: 0
+
+    # ---- Procurement / Internal --------------------------------------------
+
+    ProcurementCase:
+      type: object
+      required: [id, rfq_id, stage, priority, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        rfq_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        assigned_agent_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+          nullable: true
+        priority:
+          type: string
+          enum: [low, normal, high, urgent]
+        stage:
+          type: string
+          enum: [new, sourcing, bids_received, negotiating, offer_drafting, offer_approved, closed_won, closed_lost]
+        sla_due_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SupplierLead:
+      type: object
+      required: [id, legal_name, source, verification_status, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        legal_name:
+          type: string
+        source:
+          type: string
+          enum: [proactive_outreach, referral, platform_registered, directory]
+        verification_status:
+          type: string
+          enum: [unverified, in_progress, verified, rejected]
+        region_id:
+          type: string
+          nullable: true
+        contact_name:
+          type: string
+          nullable: true
+        contact_phone:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    OfflineQuote:
+      type: object
+      required: [id, case_id, supplier_lead_id, unit_price_paise, qty, submitted_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        case_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        supplier_lead_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        unit_price_paise:
+          type: integer
+          minimum: 1
+        freight_paise:
+          type: integer
+          minimum: 0
+        qty:
+          type: integer
+          minimum: 1
+        moq:
+          type: integer
+          minimum: 1
+        lead_time_days:
+          type: integer
+          minimum: 0
+        supplier_confirmation_ref:
+          type: string
+          description: Reference to documentary evidence (call recording, email, signed quote) stored in object storage.
+        notes:
+          type: string
+          nullable: true
+        submitted_at:
+          type: string
+          format: date-time
+        submitted_by:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+
+    ReconciliationException:
+      type: object
+      required: [id, run_id, entity_type, entity_id, discrepancy_paise, status, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        run_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        entity_type:
+          type: string
+          enum: [payment, refund, settlement, chargeback]
+        entity_id:
+          type: string
+        discrepancy_paise:
+          type: integer
+          description: Positive means provider shows more than internal ledger; negative means less.
+        status:
+          type: string
+          enum: [open, under_review, resolved, escalated]
+        notes:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    AuditLogEntry:
+      type: object
+      required: [id, actor_id, action, resource_type, resource_id, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        actor_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        actor_role:
+          type: string
+        action:
+          type: string
+          description: Verb describing the operation (e.g., offer.approved, settlement.submitted).
+        resource_type:
+          type: string
+        resource_id:
+          type: string
+        diff_summary:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Before/after summary for mutation events. PII is redacted.
+        ip_address:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    # ---- Seller-led Deals --------------------------------------------------
+
+    SellerDeal:
+      type: object
+      required: [id, seller_id, variant_id, status, deadline, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        seller_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        variant_id:
+          type: string
+          pattern: '^[0-9A-Z]{26}$'
+        title:
+          type: string
+        description:
+          type: string
+          nullable: true
+        price_tiers:
+          type: array
+          items:
+            $ref: '#/components/schemas/OfferPriceTier'
+        moq:
+          type: integer
+          minimum: 1
+        available_qty:
+          type: integer
+          minimum: 1
+        regions:
+          type: array
+          items:
+            type: string
+        deadline:
+          type: string
+          format: date-time
+        fulfillment_sla_days:
+          type: integer
+          minimum: 1
+        return_policy_days:
+          type: integer
+          minimum: 0
+        warranty_months:
+          type: integer
+          minimum: 0
+        tax_basis:
+          type: string
+          enum: [inclusive, exclusive]
+        status:
+          type: string
+          enum: [draft, pending_review, active, moq_reached, expired, closed, cancelled]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+# ===========================================================================
+# Paths
+# ===========================================================================
+
+paths:
+
+  # --------------------------------------------------------------------------
+  # AUTH
+  # --------------------------------------------------------------------------
+
+  /v1/auth/otp/request:
+    post:
+      tags: [Auth]
+      summary: Request OTP
+      description: |
+        Sends a one-time password to the provided mobile number via SMS.
+        Rate-limited per mobile number to prevent abuse.
+        No authentication required.
+      operationId: requestOtp
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mobile]
+              properties:
+                mobile:
+                  type: string
+                  pattern: '^\+91[6-9]\d{9}$'
+                  description: E.164-formatted Indian mobile number.
+                  example: "+919876543210"
+                purpose:
+                  type: string
+                  enum: [login, registration, account_deletion]
+                  default: login
+      responses:
+        '200':
+          description: OTP sent successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [expires_in_seconds, masked_mobile]
+                properties:
+                  masked_mobile:
+                    type: string
+                    example: "+91xxxxxxx210"
+                  expires_in_seconds:
+                    type: integer
+                    example: 300
+                  resend_allowed_after_seconds:
+                    type: integer
+                    example: 60
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/auth/otp/verify:
+    post:
+      tags: [Auth]
+      summary: Verify OTP and issue JWT
+      description: |
+        Validates the OTP and returns a signed JWT access token and a refresh token.
+        Creates a new user record if the mobile number is not registered.
+      operationId: verifyOtp
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mobile, otp]
+              properties:
+                mobile:
+                  type: string
+                  pattern: '^\+91[6-9]\d{9}$'
+                otp:
+                  type: string
+                  pattern: '^\d{6}$'
+                  description: 6-digit OTP from SMS.
+      responses:
+        '200':
+          description: Authentication successful.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, token_type, expires_in, user]
+                properties:
+                  access_token:
+                    type: string
+                    description: Short-lived JWT (15 min recommended).
+                  refresh_token:
+                    type: string
+                    description: Long-lived refresh token; store securely.
+                  token_type:
+                    type: string
+                    enum: [Bearer]
+                  expires_in:
+                    type: integer
+                    description: Access token TTL in seconds.
+                    example: 900
+                  user:
+                    $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # CATALOG & DEALS (Public)
+  # --------------------------------------------------------------------------
+
+  /v1/catalog/search:
+    get:
+      tags: [Catalog]
+      summary: Search catalog
+      description: |
+        Full-text and faceted search across products and variants.
+        Public endpoint; no authentication required.
+      operationId: searchCatalog
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 256
+          description: Free-text search query.
+        - name: category_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: region_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Search results.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProductVariant'
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/deals:
+    get:
+      tags: [Catalog]
+      summary: List active seller-led deals
+      description: |
+        Returns published seller-led group deals that are currently accepting joiners.
+        Public endpoint; authenticated users receive membership status if applicable.
+      operationId: listDeals
+      parameters:
+        - name: region_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: category_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Active deals.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SellerDeal'
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/deals/{id}:
+    get:
+      tags: [Catalog]
+      summary: Get deal details
+      description: Returns full details for a single seller-led deal. Public endpoint.
+      operationId: getDeal
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Deal details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerDeal'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # BUY REQUESTS
+  # --------------------------------------------------------------------------
+
+  /v1/buy-requests:
+    post:
+      tags: [BuyRequests]
+      summary: Create a buy request
+      description: |
+        A buyer submits a new product request. This does NOT create an order or
+        payment obligation. The system will attempt to match it to an existing
+        demand group or create a new one.
+
+        **Required role:** authenticated buyer.
+      operationId: createBuyRequest
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [qty, region_id, spec_summary]
+              properties:
+                variant_id:
+                  type: string
+                  pattern: '^[0-9A-Z]{26}$'
+                  nullable: true
+                  description: Catalog variant ID if the buyer selected from catalog; null for free-form requests.
+                spec_summary:
+                  type: string
+                  minLength: 10
+                  maxLength: 2000
+                  description: Human-readable product description (required when variant_id is null).
+                spec_json:
+                  type: object
+                  additionalProperties: true
+                  nullable: true
+                qty:
+                  type: integer
+                  minimum: 1
+                region_id:
+                  type: string
+                purchase_by:
+                  type: string
+                  format: date
+                  nullable: true
+                alternatives_acceptable:
+                  type: boolean
+                  default: false
+                target_budget_paise:
+                  type: integer
+                  minimum: 0
+                  nullable: true
+                  description: |
+                    Optional buyer target price per unit in paise.
+                    INTERNAL ONLY: this value is never exposed to sellers or other buyers.
+      responses:
+        '201':
+          description: Buy request created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuyRequest'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/buy-requests/{id}:
+    get:
+      tags: [BuyRequests]
+      summary: Get buy request
+      description: |
+        Returns the buy request. The caller must be the owning buyer.
+        Internal staff with procurement role may also access any request.
+
+        **Required role:** buyer (own request) or procurement agent/lead.
+      operationId: getBuyRequest
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Buy request details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuyRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # GROUPS
+  # --------------------------------------------------------------------------
+
+  /v1/groups/{id}/join:
+    post:
+      tags: [Groups]
+      summary: Join a demand group
+      description: |
+        Buyer expresses demand-aggregation intent to join a group.
+        This is NOT a purchase commitment or payment obligation.
+
+        **Required role:** authenticated buyer.
+      operationId: joinGroup
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [qty]
+              properties:
+                qty:
+                  type: integer
+                  minimum: 1
+                intent_level:
+                  type: string
+                  enum: [interested, purchase_ready]
+                  default: interested
+                buy_request_id:
+                  type: string
+                  pattern: '^[0-9A-Z]{26}$'
+                  nullable: true
+                  description: Link to an existing buy request if applicable.
+      responses:
+        '201':
+          description: Group membership created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupMembership'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/groups/{id}/reconfirm:
+    post:
+      tags: [Groups]
+      summary: Reconfirm purchase readiness
+      description: |
+        After an offer is published, buyers must actively reconfirm they are ready to
+        purchase before checkout is allowed. Prevents stale demand from progressing.
+
+        **Required role:** authenticated buyer (member of this group).
+      operationId: reconfirmGroup
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirmed]
+              properties:
+                confirmed:
+                  type: boolean
+                  description: Must be true to advance to confirmed intent level.
+                qty:
+                  type: integer
+                  minimum: 1
+                  nullable: true
+                  description: Updated quantity if buyer wishes to change from join-time qty.
+      responses:
+        '200':
+          description: Reconfirmation recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupMembership'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # OFFERS
+  # --------------------------------------------------------------------------
+
+  /v1/offers/{id}:
+    get:
+      tags: [Offers]
+      summary: Get offer details
+      description: |
+        Returns a published offer. Seller identity and source bid details are
+        redacted from buyer-facing responses.
+
+        **Required role:** authenticated buyer (member of the group) or internal staff.
+      operationId: getOffer
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Offer details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Offer'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/offers/{id}/accept:
+    post:
+      tags: [Offers]
+      summary: Accept an offer
+      description: |
+        Buyer accepts the terms of a published offer for a specified quantity.
+        Records an irrevocable acceptance snapshot (terms_hash) but does NOT
+        immediately charge the buyer. A stock reservation is created.
+        The buyer must proceed to checkout to complete payment.
+
+        **Required role:** authenticated buyer (confirmed group member).
+      operationId: acceptOffer
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [qty, accepted_terms_hash]
+              properties:
+                qty:
+                  type: integer
+                  minimum: 1
+                accepted_terms_hash:
+                  type: string
+                  description: |
+                    SHA-256 of the terms_snapshot the buyer has viewed. The server
+                    validates this against the current offer version to prevent silent repricing.
+      responses:
+        '201':
+          description: Offer accepted; stock reserved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [acceptance_id, order_id, reservation_expires_at]
+                properties:
+                  acceptance_id:
+                    type: string
+                    pattern: '^[0-9A-Z]{26}$'
+                  order_id:
+                    type: string
+                    pattern: '^[0-9A-Z]{26}$'
+                    description: Newly created order in pending_payment status.
+                  reservation_expires_at:
+                    type: string
+                    format: date-time
+                    description: Time by which checkout must be completed or the reservation lapses.
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # ORDERS
+  # --------------------------------------------------------------------------
+
+  /v1/orders/{id}/checkout:
+    post:
+      tags: [Orders]
+      summary: Initiate checkout / payment intent
+      description: |
+        Creates a payment intent for the order and returns a provider-specific
+        checkout token/URL. The buyer completes payment on the provider's page or
+        via SDK. Payment completion is confirmed via webhook asynchronously.
+
+        Idempotency-Key is required to prevent duplicate payment intents.
+
+        **Required role:** authenticated buyer (order owner, status must be pending_payment).
+      operationId: checkoutOrder
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [shipping_address_id]
+              properties:
+                shipping_address_id:
+                  type: string
+                  pattern: '^[0-9A-Z]{26}$'
+                provider_preference:
+                  type: string
+                  nullable: true
+                  description: Optional hint for preferred payment method/provider.
+      responses:
+        '200':
+          description: Checkout initiated; payment details returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payment_intent_id, provider, checkout_token, amount_paise, currency]
+                properties:
+                  payment_intent_id:
+                    type: string
+                    pattern: '^[0-9A-Z]{26}$'
+                  provider:
+                    type: string
+                  checkout_token:
+                    type: string
+                    description: Provider-issued token or order ID for client-side SDK.
+                  checkout_url:
+                    type: string
+                    format: uri
+                    nullable: true
+                    description: Redirect URL if provider uses hosted page flow.
+                  amount_paise:
+                    type: integer
+                  currency:
+                    type: string
+                    enum: [INR]
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get order
+      description: |
+        Returns order details. The buyer sees their own order.
+        Seller sees only their fulfillment-scoped view (not other items).
+        Internal staff sees full detail.
+
+        **Required role:** buyer (own order), seller (own fulfillment order), or internal staff.
+      operationId: getOrder
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Order details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # SHIPMENTS
+  # --------------------------------------------------------------------------
+
+  /v1/shipments/{id}/acknowledgements:
+    post:
+      tags: [Shipments]
+      summary: Acknowledge shipment delivery
+      description: |
+        Buyer records received quantities and disputed quantities after delivery.
+        Triggers the inspection/settlement eligibility evaluation.
+        Once submitted this record is immutable.
+
+        **Required role:** authenticated buyer (order owner, shipment must be in delivered status).
+      operationId: acknowledgeShipment
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accepted_qty, disputed_qty]
+              properties:
+                accepted_qty:
+                  type: object
+                  additionalProperties:
+                    type: integer
+                    minimum: 0
+                  description: Map of order_item_id to accepted quantity.
+                disputed_qty:
+                  type: object
+                  additionalProperties:
+                    type: integer
+                    minimum: 0
+                  description: Map of order_item_id to disputed quantity. Sum per item must equal shipped qty.
+                notes:
+                  type: string
+                  maxLength: 2000
+                  nullable: true
+      responses:
+        '201':
+          description: Acknowledgement recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuyerAcknowledgement'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # DISPUTES
+  # --------------------------------------------------------------------------
+
+  /v1/orders/{id}/disputes:
+    post:
+      tags: [Orders]
+      summary: Open a dispute on an order
+      description: |
+        Buyer raises a formal dispute against an order. A dispute can only be
+        opened when the order is in delivered, acknowledged, or completed status,
+        and within the legally/policy-defined dispute window.
+
+        **Required role:** authenticated buyer (order owner).
+      operationId: createDispute
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, description]
+              properties:
+                type:
+                  type: string
+                  enum: [not_delivered, wrong_item, damaged, quantity_short, quality_issue, other]
+                description:
+                  type: string
+                  minLength: 20
+                  maxLength: 5000
+                affected_items:
+                  type: array
+                  items:
+                    type: object
+                    required: [order_item_id, qty_affected]
+                    properties:
+                      order_item_id:
+                        type: string
+                        pattern: '^[0-9A-Z]{26}$'
+                      qty_affected:
+                        type: integer
+                        minimum: 1
+                evidence_refs:
+                  type: array
+                  items:
+                    type: string
+                  description: Pre-signed object storage references for uploaded evidence (photos, videos).
+      responses:
+        '201':
+          description: Dispute opened.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dispute'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # ME (self-service)
+  # --------------------------------------------------------------------------
+
+  /v1/me/requests:
+    get:
+      tags: [Me]
+      summary: List own buy requests
+      description: |
+        Returns paginated list of the authenticated buyer's buy requests.
+
+        **Required role:** authenticated buyer.
+      operationId: listMyRequests
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [draft, submitted, grouping, rfq_issued, offer_received, accepted, ordered, closed, cancelled]
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Buyer's buy requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BuyRequest'
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/me/orders:
+    get:
+      tags: [Me]
+      summary: List own orders
+      description: |
+        Returns paginated list of the authenticated buyer's orders.
+
+        **Required role:** authenticated buyer.
+      operationId: listMyOrders
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Buyer's orders.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Order'
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/me/account:
+    delete:
+      tags: [Me]
+      summary: Request account deletion
+      description: |
+        Initiates a controlled account deletion flow. The request is queued for
+        compliance review; immediate hard-deletion is not performed.
+        Data retention requirements (legal, tax, dispute) are honored before erasure.
+        The user will receive a confirmation timeline via SMS/email.
+
+        **Required role:** authenticated buyer (own account).
+      operationId: deleteMyAccount
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 1000
+                  nullable: true
+      responses:
+        '202':
+          description: Deletion request accepted; processing asynchronously.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, estimated_completion_days]
+                properties:
+                  status:
+                    type: string
+                    enum: [deletion_requested]
+                  estimated_completion_days:
+                    type: integer
+                    example: 30
+                  message:
+                    type: string
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # SELLER
+  # --------------------------------------------------------------------------
+
+  /v1/seller/onboarding:
+    post:
+      tags: [Seller]
+      summary: Submit seller onboarding application
+      description: |
+        Creates or updates the seller's onboarding/verification application.
+        Submits organization and KYC details for compliance review.
+        A seller bank account token (from the payment provider) may be included.
+
+        **Required role:** authenticated user (becoming a seller).
+      operationId: sellerOnboarding
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [legal_name, tax_id_ref, categories, service_regions, contact_name, contact_mobile]
+              properties:
+                legal_name:
+                  type: string
+                  maxLength: 500
+                tax_id_ref:
+                  type: string
+                  description: GST number or PAN reference.
+                categories:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                service_regions:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                contact_name:
+                  type: string
+                contact_mobile:
+                  type: string
+                  pattern: '^\+91[6-9]\d{9}$'
+                bank_account_provider_token:
+                  type: string
+                  nullable: true
+                  description: |
+                    Token issued by the payment provider after seller completes the
+                    provider's bank account collection flow. Raw bank account details
+                    must NEVER be sent to this API.
+                address:
+                  type: object
+                  properties:
+                    region:
+                      type: string
+                    postal_code:
+                      type: string
+                    address_line:
+                      type: string
+      responses:
+        '201':
+          description: Onboarding application submitted; under review.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerProfile'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/seller/rfqs:
+    get:
+      tags: [Seller]
+      summary: List RFQs the seller is invited to
+      description: |
+        Returns active RFQs where the authenticated seller has been invited to bid.
+        Does NOT include bid amounts or competing bids.
+
+        **Required role:** active seller.
+      operationId: listSellerRFQs
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [open, closed, cancelled]
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Invited RFQs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/RFQ'
+                        - type: object
+                          properties:
+                            my_bid_status:
+                              type: string
+                              enum: [not_submitted, submitted, under_review, shortlisted, rejected, awarded, withdrawn]
+                              nullable: true
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/seller/rfqs/{id}/bids:
+    post:
+      tags: [Seller]
+      summary: Submit initial bid on an RFQ
+      description: |
+        Seller submits a sealed bid (first revision) on an open RFQ.
+        The bid is NOT visible to buyers or other sellers.
+
+        **Required role:** active seller (invited to this RFQ, bid deadline not passed).
+      operationId: submitSellerBid
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [unit_price_paise, tax_basis, freight_paise, moq, valid_until, lead_time_days]
+              properties:
+                unit_price_paise:
+                  type: integer
+                  minimum: 1
+                tax_basis:
+                  type: string
+                  enum: [inclusive, exclusive]
+                gst_rate_percent:
+                  type: number
+                  nullable: true
+                freight_paise:
+                  type: integer
+                  minimum: 0
+                moq:
+                  type: integer
+                  minimum: 1
+                max_qty:
+                  type: integer
+                  nullable: true
+                valid_until:
+                  type: string
+                  format: date-time
+                lead_time_days:
+                  type: integer
+                  minimum: 0
+                warranty_months:
+                  type: integer
+                  minimum: 0
+                  nullable: true
+                notes:
+                  type: string
+                  maxLength: 2000
+                  nullable: true
+      responses:
+        '201':
+          description: Bid submitted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerBid'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/seller/bids/{id}/revisions:
+    post:
+      tags: [Seller]
+      summary: Submit a bid revision
+      description: |
+        Appends a new revision to an existing bid. Each revision is immutable
+        once submitted; the latest revision_no becomes the active revision.
+        Revisions are only permitted while the RFQ is open and negotiation is active.
+
+        **Required role:** active seller (owner of the bid).
+      operationId: submitBidRevision
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [unit_price_paise, tax_basis, freight_paise, moq, valid_until, lead_time_days]
+              properties:
+                unit_price_paise:
+                  type: integer
+                  minimum: 1
+                tax_basis:
+                  type: string
+                  enum: [inclusive, exclusive]
+                gst_rate_percent:
+                  type: number
+                  nullable: true
+                freight_paise:
+                  type: integer
+                  minimum: 0
+                moq:
+                  type: integer
+                  minimum: 1
+                max_qty:
+                  type: integer
+                  nullable: true
+                valid_until:
+                  type: string
+                  format: date-time
+                lead_time_days:
+                  type: integer
+                  minimum: 0
+                warranty_months:
+                  type: integer
+                  minimum: 0
+                  nullable: true
+                notes:
+                  type: string
+                  maxLength: 2000
+                  nullable: true
+      responses:
+        '201':
+          description: Bid revision appended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerBidRevision'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/seller/orders:
+    get:
+      tags: [Seller]
+      summary: List seller fulfillment orders
+      description: |
+        Returns the authenticated seller's orders that require fulfillment action.
+
+        **Required role:** active seller.
+      operationId: listSellerOrders
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Seller fulfillment orders.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, offer_id, status, created_at]
+                      properties:
+                        id:
+                          type: string
+                          pattern: '^[0-9A-Z]{26}$'
+                        offer_id:
+                          type: string
+                          pattern: '^[0-9A-Z]{26}$'
+                        status:
+                          type: string
+                          enum: [awaiting_confirmation, confirmed, dispatched, delivered, completed, cancelled]
+                        supplier_confirmation_ref:
+                          type: string
+                          nullable: true
+                        total_qty:
+                          type: integer
+                        created_at:
+                          type: string
+                          format: date-time
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/seller/orders/{id}/dispatch:
+    post:
+      tags: [Seller]
+      summary: Mark order as dispatched
+      description: |
+        Seller records dispatch details (carrier, tracking, shipment items).
+        MOQ must have been reached before dispatch is permitted.
+
+        **Required role:** active seller (owner of fulfillment order).
+      operationId: dispatchSellerOrder
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [carrier, tracking_ref, items]
+              properties:
+                carrier:
+                  type: string
+                tracking_ref:
+                  type: string
+                estimated_delivery_date:
+                  type: string
+                  format: date
+                  nullable: true
+                items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [order_item_id, qty]
+                    properties:
+                      order_item_id:
+                        type: string
+                        pattern: '^[0-9A-Z]{26}$'
+                      qty:
+                        type: integer
+                        minimum: 1
+      responses:
+        '200':
+          description: Dispatch recorded; shipment created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Shipment'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/seller/settlements:
+    get:
+      tags: [Seller]
+      summary: List seller settlements
+      description: |
+        Returns the authenticated seller's settlement records and their payout status.
+
+        **Required role:** active seller.
+      operationId: listSellerSettlements
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [draft, pending_approval, approved, submitted_to_provider, settled, failed, on_hold]
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Seller settlements.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Settlement'
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/seller/deals:
+    post:
+      tags: [Seller]
+      summary: Create a seller-led group deal
+      description: |
+        Seller publishes a bulk availability offer (seller-led deal).
+        The deal undergoes internal review before being published to buyers.
+
+        **Required role:** active seller.
+      operationId: createSellerDeal
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [variant_id, title, moq, available_qty, regions, deadline, fulfillment_sla_days, tax_basis, price_tiers]
+              properties:
+                variant_id:
+                  type: string
+                  pattern: '^[0-9A-Z]{26}$'
+                title:
+                  type: string
+                  maxLength: 300
+                description:
+                  type: string
+                  maxLength: 5000
+                  nullable: true
+                moq:
+                  type: integer
+                  minimum: 1
+                available_qty:
+                  type: integer
+                  minimum: 1
+                regions:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                deadline:
+                  type: string
+                  format: date-time
+                fulfillment_sla_days:
+                  type: integer
+                  minimum: 1
+                return_policy_days:
+                  type: integer
+                  minimum: 0
+                  default: 0
+                warranty_months:
+                  type: integer
+                  minimum: 0
+                  default: 0
+                tax_basis:
+                  type: string
+                  enum: [inclusive, exclusive]
+                price_tiers:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [min_paid_qty, unit_price_paise]
+                    properties:
+                      min_paid_qty:
+                        type: integer
+                        minimum: 1
+                      max_paid_qty:
+                        type: integer
+                        nullable: true
+                      unit_price_paise:
+                        type: integer
+                        minimum: 1
+      responses:
+        '201':
+          description: Deal submitted for review.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SellerDeal'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # INTERNAL
+  # --------------------------------------------------------------------------
+
+  /v1/internal/procurement/cases:
+    get:
+      tags: [Internal]
+      summary: List procurement cases
+      description: |
+        Returns procurement cases. Procurement agents see only cases assigned to them
+        or in their category scope. Procurement leads and admins see all.
+
+        **Required permission:** `procurement:cases:read`
+      operationId: listProcurementCases
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: stage
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [new, sourcing, bids_received, negotiating, offer_drafting, offer_approved, closed_won, closed_lost]
+        - name: assigned_agent_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: priority
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [low, normal, high, urgent]
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Procurement cases.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProcurementCase'
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/cases/{id}/assign:
+    post:
+      tags: [Internal]
+      summary: Assign a case to an agent
+      description: |
+        Assigns or reassigns a procurement case to an agent.
+        A case cannot be self-approved by the same person who created the assignment request
+        for high-risk financial operations.
+
+        **Required permission:** `procurement:cases:assign`
+      operationId: assignCase
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+                  pattern: '^[0-9A-Z]{26}$'
+                  description: User ID of the procurement agent to assign.
+                note:
+                  type: string
+                  maxLength: 1000
+                  nullable: true
+      responses:
+        '200':
+          description: Case assigned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcurementCase'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/cases/{id}/supplier-leads:
+    post:
+      tags: [Internal]
+      summary: Add a supplier lead to a case
+      description: |
+        Records a proactively sourced supplier lead linked to a procurement case.
+
+        **Required permission:** `procurement:cases:edit`
+      operationId: addSupplierLead
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [legal_name, source]
+              properties:
+                legal_name:
+                  type: string
+                source:
+                  type: string
+                  enum: [proactive_outreach, referral, platform_registered, directory]
+                contact_name:
+                  type: string
+                  nullable: true
+                contact_phone:
+                  type: string
+                  nullable: true
+                region_id:
+                  type: string
+                  nullable: true
+                notes:
+                  type: string
+                  maxLength: 2000
+                  nullable: true
+      responses:
+        '201':
+          description: Supplier lead added.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupplierLead'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/cases/{id}/offline-quotes:
+    post:
+      tags: [Internal]
+      summary: Record an offline supplier quote
+      description: |
+        Records a quote obtained via phone, email, or in-person contact with a supplier.
+        A supplier_confirmation_ref (evidence object reference) is REQUIRED to ensure
+        the quote is documented and auditable. This is not a binding seller bid.
+
+        **Required permission:** `procurement:cases:edit`
+      operationId: recordOfflineQuote
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [supplier_lead_id, unit_price_paise, freight_paise, qty, moq, lead_time_days, supplier_confirmation_ref]
+              properties:
+                supplier_lead_id:
+                  type: string
+                  pattern: '^[0-9A-Z]{26}$'
+                unit_price_paise:
+                  type: integer
+                  minimum: 1
+                freight_paise:
+                  type: integer
+                  minimum: 0
+                qty:
+                  type: integer
+                  minimum: 1
+                moq:
+                  type: integer
+                  minimum: 1
+                lead_time_days:
+                  type: integer
+                  minimum: 0
+                supplier_confirmation_ref:
+                  type: string
+                  description: Object storage reference to documentary evidence (call recording, email scan, signed quote PDF).
+                notes:
+                  type: string
+                  maxLength: 2000
+                  nullable: true
+      responses:
+        '201':
+          description: Offline quote recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfflineQuote'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/rfqs/{id}/confidential-bids:
+    get:
+      tags: [Internal]
+      summary: View confidential bids for an RFQ
+      description: |
+        Returns all sealed bids for an RFQ including full revision history and pricing.
+        This endpoint is strictly access-controlled. Access is denied to:
+        - Buyers (any role)
+        - Sellers (including the bidding seller viewing other sellers' bids)
+        - Support agents without explicit procurement lead or compliance role
+
+        Access is logged to the audit trail on every call.
+
+        **Required permission:** `bids:read:confidential` (procurement lead, compliance, super admin only)
+      operationId: listConfidentialBids
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+      responses:
+        '200':
+          description: Confidential bids for the RFQ.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rfq_id, bids]
+                properties:
+                  rfq_id:
+                    type: string
+                    pattern: '^[0-9A-Z]{26}$'
+                  bids:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/SellerBid'
+                        - type: object
+                          properties:
+                            revisions:
+                              type: array
+                              items:
+                                $ref: '#/components/schemas/SellerBidRevision'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/offers:
+    post:
+      tags: [Internal]
+      summary: Create a negotiated offer (draft)
+      description: |
+        Internal staff creates a draft offer based on a winning bid revision or
+        an offline quote. The offer is not visible to buyers until published.
+
+        **Required permission:** `offers:create`
+      operationId: createInternalOffer
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [group_id, seller_id, expires_at, price_tiers, terms_snapshot]
+              properties:
+                group_id:
+                  type: string
+                  pattern: '^[0-9A-Z]{26}$'
+                seller_id:
+                  type: string
+                  pattern: '^[0-9A-Z]{26}$'
+                source_bid_revision_id:
+                  type: string
+                  pattern: '^[0-9A-Z]{26}$'
+                  nullable: true
+                  description: Winning bid revision if sourced online; null for offline-sourced offers.
+                expires_at:
+                  type: string
+                  format: date-time
+                price_tiers:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [min_paid_qty, unit_price_paise]
+                    properties:
+                      min_paid_qty:
+                        type: integer
+                        minimum: 1
+                      max_paid_qty:
+                        type: integer
+                        nullable: true
+                      unit_price_paise:
+                        type: integer
+                        minimum: 1
+                terms_snapshot:
+                  type: object
+                  additionalProperties: true
+                  description: Full commercial terms to be presented to buyers.
+      responses:
+        '201':
+          description: Offer draft created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Offer'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/offers/{id}/approve:
+    post:
+      tags: [Internal]
+      summary: Approve an offer
+      description: |
+        Records a procurement lead / finance approver approval decision on a draft offer.
+        An offer cannot be approved by the same person who created it (maker-checker).
+
+        **Required permission:** `offers:approve`
+      operationId: approveOffer
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [approved, rejected]
+                reason:
+                  type: string
+                  maxLength: 2000
+                  nullable: true
+      responses:
+        '200':
+          description: Approval decision recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Offer'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/offers/{id}/publish:
+    post:
+      tags: [Internal]
+      summary: Publish an approved offer to buyers
+      description: |
+        Makes an approved offer visible to group members. After publication the
+        offer terms are immutable; version is incremented. Buyers will be notified.
+
+        **Required permission:** `offers:publish`
+      operationId: publishOffer
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                buyer_notification_message:
+                  type: string
+                  maxLength: 500
+                  nullable: true
+                  description: Optional custom message to include in buyer notification.
+      responses:
+        '200':
+          description: Offer published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Offer'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/inspections/{id}/complete:
+    post:
+      tags: [Internal]
+      summary: Complete an inspection
+      description: |
+        Records the final inspection result for a shipment/order.
+        Triggers downstream settlement eligibility recalculation for affected items.
+
+        **Required permission:** `inspections:complete`
+      operationId: completeInspection
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [result, checklist_snapshot]
+              properties:
+                result:
+                  type: string
+                  enum: [passed, failed, partial, not_required]
+                checklist_snapshot:
+                  type: object
+                  additionalProperties: true
+                  description: Completed inspection checklist items as a JSON snapshot.
+                findings:
+                  type: array
+                  items:
+                    type: object
+                    required: [order_item_id, finding_type, qty_affected]
+                    properties:
+                      order_item_id:
+                        type: string
+                        pattern: '^[0-9A-Z]{26}$'
+                      finding_type:
+                        type: string
+                        enum: [conforming, non_conforming, damaged, missing, quantity_short]
+                      qty_affected:
+                        type: integer
+                        minimum: 0
+                      evidence_ref:
+                        type: string
+                        nullable: true
+                notes:
+                  type: string
+                  maxLength: 5000
+                  nullable: true
+      responses:
+        '200':
+          description: Inspection completed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, order_id, result, completed_at]
+                properties:
+                  id:
+                    type: string
+                    pattern: '^[0-9A-Z]{26}$'
+                  order_id:
+                    type: string
+                    pattern: '^[0-9A-Z]{26}$'
+                  shipment_id:
+                    type: string
+                    pattern: '^[0-9A-Z]{26}$'
+                  result:
+                    type: string
+                    enum: [passed, failed, partial, not_required]
+                  completed_at:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/settlements/{id}/approve:
+    post:
+      tags: [Internal]
+      summary: Approve a seller settlement
+      description: |
+        Finance approver authorizes or rejects a pending seller settlement.
+        Maker-checker enforced: the person who prepared the settlement cannot approve it.
+        Approval triggers submission to the payment provider.
+        No direct bank transfer is initiated from this API; provider handles actual payout.
+
+        **Required permission:** `settlements:approve`
+      operationId: approveSettlement
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [approved, rejected, on_hold]
+                reason:
+                  type: string
+                  maxLength: 2000
+                  nullable: true
+      responses:
+        '200':
+          description: Settlement approval recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Settlement'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/disputes/{id}/resolve:
+    post:
+      tags: [Internal]
+      summary: Resolve a dispute
+      description: |
+        Support/disputes team records the resolution decision including type and
+        any adjustment (refund amount, replacement order, etc.).
+
+        **Required permission:** `disputes:resolve`
+      operationId: resolveDispute
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resolution_type, resolution_summary]
+              properties:
+                resolution_type:
+                  type: string
+                  enum: [refund, replacement, partial_refund, no_action, escalated_external]
+                resolution_summary:
+                  type: string
+                  minLength: 20
+                  maxLength: 5000
+                refund_amount_paise:
+                  type: integer
+                  minimum: 0
+                  nullable: true
+                  description: Required when resolution_type is refund or partial_refund.
+                affected_items:
+                  type: array
+                  nullable: true
+                  items:
+                    type: object
+                    required: [order_item_id, qty_resolved]
+                    properties:
+                      order_item_id:
+                        type: string
+                        pattern: '^[0-9A-Z]{26}$'
+                      qty_resolved:
+                        type: integer
+                        minimum: 0
+      responses:
+        '200':
+          description: Dispute resolved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dispute'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/reconciliation/exceptions:
+    get:
+      tags: [Internal]
+      summary: List reconciliation exceptions
+      description: |
+        Returns payment/settlement reconciliation exceptions where the internal ledger
+        disagrees with the payment provider's settlement report.
+        An unresolved exception must block false "paid" or "settled" status transitions.
+
+        **Required permission:** `finance:reconciliation:read`
+      operationId: listReconciliationExceptions
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [open, under_review, resolved, escalated]
+        - name: entity_type
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [payment, refund, settlement, chargeback]
+        - name: run_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Reconciliation exceptions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ReconciliationException'
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  /v1/internal/audit:
+    get:
+      tags: [Internal]
+      summary: Query audit log
+      description: |
+        Returns immutable audit log entries. PII in diff_summary is redacted.
+        Supports filtering by actor, resource type, action, and time range.
+
+        **Required permission:** `audit:read` (compliance/admin, super admin only)
+      operationId: queryAuditLog
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: actor_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: resource_type
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: action
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Filter entries at or after this timestamp (UTC ISO 8601).
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Filter entries at or before this timestamp (UTC ISO 8601).
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Audit log entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AuditLogEntry'
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+
+  # --------------------------------------------------------------------------
+  # WEBHOOKS
+  # --------------------------------------------------------------------------
+
+  /v1/webhooks/payments/{provider}:
+    post:
+      tags: [Webhooks]
+      summary: Receive inbound payment webhook
+      description: |
+        Receives payment event callbacks from payment providers (e.g., Razorpay, Cashfree).
+
+        **Security controls (MUST all pass before processing):**
+        1. Signature verification using provider-specific HMAC or RSA method against raw request body.
+        2. Timestamp/replay attack check: reject events older than 5 minutes.
+        3. Idempotency check: `payment_webhook_events(provider, provider_event_id)` must be UNIQUE;
+           duplicate deliveries are acknowledged (200) without reprocessing.
+        4. Processing is fully asynchronous via queue; this endpoint only persists and enqueues.
+
+        **No authentication header required** (webhook is called by provider, not by our users).
+        The route is not behind BearerAuth; it uses signature-based auth instead.
+
+        Supported providers: `razorpay`, `cashfree` (expand per integration).
+      operationId: receivePaymentWebhook
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [razorpay, cashfree]
+      requestBody:
+        required: true
+        description: |
+          Raw JSON body from the payment provider. The exact schema varies by provider
+          and event type. The body is stored as-is in payload_ref before parsing.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: Provider-defined webhook payload. See provider documentation for event schemas.
+              example:
+                event: payment.captured
+                payload:
+                  payment:
+                    entity:
+                      id: pay_ExampleId123
+                      order_id: order_ExampleOrderId
+                      amount: 50000
+                      currency: INR
+                      status: captured
+      responses:
+        '200':
+          description: |
+            Webhook acknowledged. Processing is asynchronous.
+            Returns 200 even for duplicate events (idempotent acknowledgement).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [accepted, duplicate]
+                  event_id:
+                    type: string
+                    description: Internal event ID assigned on first receipt.
+        '400':
+          description: |
+            Malformed payload (missing required provider fields).
+            Note: signature failures return 400, NOT 401, to avoid leaking auth method.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'

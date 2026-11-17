@@ -1,0 +1,16 @@
+vendor/
+composer.lock
+.env
+.env.local
+.phpunit.cache/
+storage/logs/*
+storage/uploads/*
+*.php.bak
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+node_modules/
+npm-debug.log

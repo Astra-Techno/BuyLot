@@ -1,0 +1,27 @@
+{
+    "name": "collective-commerce/api",
+    "description": "Collective Commerce Platform - Custom PHP 8.3 Backend",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": "^8.3",
+        "ext-pdo": "*",
+        "ext-json": "*",
+        "ext-redis": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "src/"
+        },
+        "files": [
+            "src/helpers.php"
+        ]
+    },
+    "scripts": {
+        "test": "phpunit",
+        "serve": "php -S localhost:8000 -t public"
+    }
+}

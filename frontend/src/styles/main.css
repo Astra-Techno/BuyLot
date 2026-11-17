@@ -1,0 +1,100 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply box-border;
+  }
+
+  html {
+    @apply scroll-smooth;
+  }
+
+  body {
+    @apply bg-neutral-50 text-neutral-900;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply px-4 py-2 rounded-lg bg-primary-600 text-white font-medium hover:bg-primary-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply px-4 py-2 rounded-lg bg-neutral-200 text-neutral-900 font-medium hover:bg-neutral-300 transition-colors;
+  }
+
+  .btn-danger {
+    @apply px-4 py-2 rounded-lg bg-danger-600 text-white font-medium hover:bg-danger-700 transition-colors;
+  }
+
+  .input-field {
+    @apply px-4 py-2 rounded-lg border border-neutral-300 focus:outline-none focus:ring-2 focus:ring-primary-600 focus:border-transparent transition-all;
+  }
+
+  .card {
+    @apply bg-white rounded-lg shadow p-6 border border-neutral-200;
+  }
+
+  .page-container {
+    @apply max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8;
+  }
+
+  .section-title {
+    @apply text-2xl font-bold text-neutral-900 mb-6;
+  }
+
+  .text-muted {
+    @apply text-neutral-600;
+  }
+
+  .link-primary {
+    @apply text-primary-600 hover:text-primary-700 cursor-pointer transition-colors;
+  }
+}
+
+/* Utility animations */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+.animate-pulse {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Responsive utilities */
+@media (max-width: 640px) {
+  .page-container {
+    @apply px-3 py-4;
+  }
+
+  .section-title {
+    @apply text-xl;
+  }
+}
+
+/* Safe area insets for PWA */
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  body {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}

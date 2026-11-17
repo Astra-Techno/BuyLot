@@ -1,0 +1,28 @@
+{
+  "name": "collective-commerce-frontend",
+  "version": "1.0.0",
+  "description": "Vue 3 + TypeScript frontend for Collective Commerce platform",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "type-check": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "vue": "^3.5.0",
+    "vue-router": "^4.3.0",
+    "pinia": "^2.1.0",
+    "@vueuse/core": "^10.9.0",
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "vite": "^5.0.0",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "vue-tsc": "^1.8.0",
+    "tailwindcss": "^3.4.0",
+    "postcss": "^8.4.0",
+    "autoprefixer": "^10.4.0"
+  }
+}
